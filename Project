@@ -1,0 +1,1068 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import logging
+import warnings
+import time
+from sklearn.preprocessing import StandardScaler
+from factor_analyzer import FactorAnalyzer
+from pandas_datareader import data as web
+import yfinance as yf
+from statsmodels.tsa.stattools import adfuller
+from hmmlearn.hmm import GaussianHMM
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+from skopt import BayesSearchCV
+from skopt.space import Real, Integer
+from sklearn.model_selection import TimeSeriesSplit, train_test_split, RandomizedSearchCV
+import xgboost as xgb
+
+
+warnings.filterwarnings('ignore')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+warnings.filterwarnings("ignore", category=UserWarning, module='sklearn')
+
+
+##########################################################
+#                COMMON CONFIGURATION                    #
+##########################################################
+class CommonConfig:
+    """
+    Configuration class defining start/end dates, FRED and Yahoo series, and file paths for data loading.
+    """
+    START_DATE = '2000-01-01'
+    END_DATE = '2025-03-26'
+    FRED_SERIES = {
+        'Credit_Spread': ('BAMLC0A4CBBBEY', 'DGS10'),
+        'TB3MS': 'TB3MS',
+        'TERMCBAUTO48NS': 'TERMCBAUTO48NS',
+        'PCE': 'PCE',
+        'CPIAUCSL': 'CPIAUCSL',
+        'GDP': 'GDP',
+        'y_lag1': 'BAMLC0A4CBBBEY'
+    }
+    YAHOO_SERIES = {
+        'SPY_DIFF': 'SPY'
+    }
+    PATHS = {
+        'TED_RATE': '/Users/jojoba/Desktop/UNISCAM/FIFTH YEAR/FINANCIAL DATA SCIENCE WITH PYTHON/PROGETTO/CREDIT SPREAD/tedspread2.xlsx',
+        'POLICY': '/Users/jojoba/Desktop/UNISCAM/FIFTH YEAR/FINANCIAL DATA SCIENCE WITH PYTHON/PROGETTO/CREDIT SPREAD/Categorical_EPU_Data.csv'
+    }
+
+
+##########################################################
+#                COMMON DATA LOADER                      #
+##########################################################
+class CommonDataLoader:
+    """
+    Class responsible for loading and fetching data from FRED, Yahoo Finance, TED Rate Excel, and policy CSV files.
+    """
+
+    def __init__(self, config):
+        self.config = config
+
+    def fetch_fred_data(self):
+        """
+        Retrieves FRED data for specified series in the configuration.
+        Computes the difference between two series if the value is a tuple.
+        """
+        fred_results = {}
+        max_retries = 3
+        for key, value in self.config.FRED_SERIES.items():
+            for attempt in range(max_retries):
+                try:
+                    if isinstance(value, tuple):
+                        data1 = web.DataReader(value[0], 'fred', self.config.START_DATE, self.config.END_DATE)
+                        data2 = web.DataReader(value[1], 'fred', self.config.START_DATE, self.config.END_DATE)
+                        fred_results[key] = data1[value[0]] - data2[value[1]]
+                        logging.info(f"{key} downloaded successfully. Last date: {fred_results[key].index[-1]}")
+                        break
+                    else:
+                        df = web.DataReader(value, 'fred', self.config.START_DATE, self.config.END_DATE)
+                        fred_results[key] = df[value]
+                        logging.info(f"{key} downloaded successfully. Last date: {fred_results[key].index[-1]}")
+                        break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        logging.error(f"Error downloading {key} after {max_retries} attempts: {e}")
+                    else:
+                        time.sleep(2 ** attempt)
+        return pd.DataFrame(fred_results)
+
+    def load_tedrate(self):
+        """
+        Loads TED rate data from an Excel file, parsing dates and yields.
+        """
+        try:
+            ted_df = pd.read_excel(
+                self.config.PATHS['TED_RATE'],
+                header=None,
+                names=["Date", "Yield"],
+                decimal=","
+            )
+            ted_df['Date'] = pd.to_datetime(ted_df['Date'], dayfirst=True, errors='coerce')
+            ted_df = ted_df.dropna(subset=['Date']).set_index('Date').sort_index()
+            ted_df = ted_df.loc[self.config.START_DATE:self.config.END_DATE]
+            logging.info(f"TEDRATE loaded. Last date: {ted_df.index[-1]}")
+            return ted_df['Yield'].rename('TEDRATE')
+        except Exception as e:
+            logging.error(f"Error loading TED rate: {e}")
+            return pd.Series(dtype=float, name='TEDRATE')
+
+    def fetch_yahoo_data(self):
+        """
+        Fetches Yahoo Finance data for specified tickers.
+        For 'SPY_DIFF', calculates the difference between EMA12 and EMA26.
+        """
+        yahoo_results = {}
+        for key, ticker in self.config.YAHOO_SERIES.items():
+            try:
+                df = yf.download(ticker, start=self.config.START_DATE, end=self.config.END_DATE,
+                                 progress=False, auto_adjust=True)
+                if not df.empty:
+                    if key == 'SPY_DIFF':
+                        df['EMA12'] = df['Close'].ewm(span=12, adjust=False).mean()
+                        df['EMA26'] = df['Close'].ewm(span=26, adjust=False).mean()
+                        yahoo_results[key] = df['EMA12'] - df['EMA26']
+                    else:
+                        yahoo_results[key] = df['Close']
+                    logging.info(f"{key} downloaded successfully. Last date: {yahoo_results[key].index[-1]}")
+            except Exception as e:
+                logging.error(f"Error downloading {key}: {e}")
+                yahoo_results[key] = pd.Series(dtype=float)
+        return pd.DataFrame(yahoo_results)
+
+    def load_policy_data(self):
+        """
+        Loads policy data from a CSV file, converting Year and Month to a datetime index.
+        """
+        try:
+            df = pd.read_csv(self.config.PATHS['POLICY'], sep=';', encoding='utf-8-sig',
+                             decimal=',', on_bad_lines='skip', engine='python')
+            df['Year'] = pd.to_numeric(df['Year'], errors='coerce').astype('Int64')
+            df['Month'] = pd.to_numeric(df['Month'], errors='coerce').astype('Int64')
+            df = df.dropna(subset=['Year', 'Month'])
+            df['Date'] = pd.to_datetime(df['Year'].astype(str) + '-' +
+                                        df['Month'].astype(str).str.zfill(2) + '-01',
+                                        errors='coerce')
+            df = df.dropna(subset=['Date']).drop(columns=['Year', 'Month']).set_index('Date')
+            logging.info(f"Policy data loaded. Last date: {df.index[-1]}, Columns: {df.columns.tolist()}")
+            return df
+        except Exception as e:
+            logging.error(f"Error loading policy data: {e}")
+            return pd.DataFrame()
+
+
+##########################################################
+#                      PIPELINE 1                        #
+##########################################################
+def feature_engineering_causale(df):
+    """
+    Applies causal feature engineering to the DataFrame.
+    Adds a one-day lag and a 5-day moving average for Credit_Spread, sets the target as the next day's value.
+    """
+    df = df.copy()
+    df['Credit_Spread_lag1'] = df['Credit_Spread'].shift(1)
+    df['Credit_Spread_MA5'] = df['Credit_Spread'].rolling(window=5, min_periods=1).mean()
+    df['Target'] = df['Credit_Spread'].shift(-1)
+    return df.dropna(subset=['Target'])
+
+
+def reduce_skew(df, cols, threshold=0.75):
+    """
+    Applies log1p transformation to reduce skewness in specified columns if it exceeds the threshold.
+    """
+    from scipy.stats import skew
+    df_trans = df.copy()
+    for col in cols:
+        s = skew(df_trans[col].dropna())
+        if abs(s) > threshold:
+            df_trans[col] = np.log1p(df_trans[col])
+            logging.info(f"Log transformation applied to {col} (skew: {s:.2f}).")
+    return df_trans
+
+
+def preprocess_data(train_df, test_df, feature_cols):
+    """
+    Preprocesses train and test DataFrames by filling missing values and scaling features.
+    """
+    train_df = train_df.fillna(method='ffill')
+    test_df = test_df.fillna(method='ffill')
+    scaler = StandardScaler()
+    train_df[feature_cols] = scaler.fit_transform(train_df[feature_cols])
+    test_df[feature_cols] = scaler.transform(test_df[feature_cols])
+    logging.info(f"Train set preprocessed - Rows: {len(train_df)}, Last date: {train_df.index[-1]}")
+    logging.info(f"Test set preprocessed - Rows: {len(test_df)}, Last date: {test_df.index[-1]}")
+    return train_df, test_df
+
+
+class EarlyStoppingRandomForest(RandomForestRegressor):
+    def __init__(self, patience=10, min_improvement=1e-4, validation_fraction=0.2, n_estimators=100, random_state=None, max_depth=None, min_samples_split=2, min_samples_leaf=1, max_features=None, **kwargs):
+        """
+        Initialize the EarlyStoppingRandomForest model.
+
+        Extends RandomForestRegressor with early stopping based on validation set performance.
+        Stops adding trees when the mean squared error (MSE) does not improve by min_improvement
+        for patience iterations.
+
+        Parameters:
+        -----------
+        patience : int, default=10
+            Number of iterations without sufficient MSE improvement before stopping.
+        min_improvement : float, default=1e-4
+            Minimum MSE improvement required to continue training.
+        validation_fraction : float, default=0.2
+            Fraction of training data used as validation set (0 < validation_fraction < 1).
+        n_estimators : int, default=100
+            Maximum number of trees (optimized by early stopping).
+        random_state : int, RandomState instance or None, default=None
+            Controls randomness of the estimator.
+        max_depth : int or None, default=None
+            Maximum depth of each tree.
+        min_samples_split : int or float, default=2
+            Minimum number of samples required to split an internal node.
+        min_samples_leaf : int or float, default=1
+            Minimum number of samples required at a leaf node.
+        max_features : int, float, str or None, default=None
+            Number of features to consider when looking for the best split.
+        **kwargs :
+            Additional parameters passed to RandomForestRegressor.
+        """
+        super().__init__(
+            n_estimators=n_estimators,
+            random_state=random_state,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            max_features=max_features,
+            **kwargs
+        )
+        self.patience = patience
+        self.min_improvement = min_improvement
+        self.validation_fraction = validation_fraction
+        self.best_score = np.inf
+        self.best_n_estimators = 0
+        self.scores = []
+        logging.info("Initialized EarlyStoppingRandomForest with patience=%s, min_improvement=%s, validation_fraction=%s", patience, min_improvement, validation_fraction)
+
+    def fit(self, X, y):
+        """
+        Fit the Random Forest model with early stopping.
+
+        Trains the model incrementally, adding one tree at a time, and evaluates performance
+        on a validation set. Stops when validation MSE does not improve sufficiently.
+        Retrains on the full dataset with the optimal number of trees.
+
+        """
+        logging.info("Starting fit with n_estimators=%s", self.n_estimators)
+        # Convert to NumPy arrays if necessary
+        if hasattr(X, 'values'):
+            X = X.values
+        if hasattr(y, 'values'):
+            y = y.values
+        # Split into training and validation sets
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=self.validation_fraction, shuffle=False, random_state=self.random_state
+        )
+        max_estimators = self.n_estimators
+        self.n_estimators = 1
+        super().fit(X_train, y_train)
+        y_pred_val = self.predict(X_val)
+        self.best_score = mean_squared_error(y_val, y_pred_val)
+        self.best_n_estimators = 1
+        self.scores.append(self.best_score)
+        no_improvement_count = 0
+        for n in range(2, max_estimators + 1):
+            self.n_estimators = n
+            super().fit(X_train, y_train)
+            y_pred_val = self.predict(X_val)
+            current_score = mean_squared_error(y_val, y_pred_val)
+            self.scores.append(current_score)
+            if self.best_score - current_score > self.min_improvement:
+                self.best_score = current_score
+                self.best_n_estimators = n
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+            if no_improvement_count >= self.patience:
+                logging.info("Early stopping triggered at %s trees", self.best_n_estimators)
+                break
+        self.n_estimators = self.best_n_estimators if self.best_n_estimators > 0 else 1
+        super().fit(X, y)
+        logging.info("Completed fit with final n_estimators=%s", self.n_estimators)
+        return self
+
+    def predict(self, X):
+        """
+        Predict using the fitted Random Forest model.
+
+        """
+        if hasattr(X, 'values'):
+            X = X.values
+        return super().predict(X)
+
+    def set_params(self, **params):
+        """
+        Set the parameters of the estimator.
+
+        """
+        logging.info("Setting parameters: %s", params)
+        # Update custom parameters
+        for param, value in params.items():
+            if param in ['patience', 'min_improvement', 'validation_fraction']:
+                setattr(self, param, value)
+        # Pass all parameters to the base class
+        super().set_params(**params)
+        return self
+
+    def get_params(self, deep=True):
+        """
+        Get parameters for this estimator.
+
+        Returns all parameters, including those inherited from RandomForestRegressor and
+        custom parameters (patience, min_improvement, validation_fraction).
+
+        """
+        # Get base class parameters
+        params = super().get_params(deep=deep)
+        # Add custom parameters
+        params.update({
+            'patience': self.patience,
+            'min_improvement': self.min_improvement,
+            'validation_fraction': self.validation_fraction
+        })
+        return params
+class ModelTuner:
+    """
+    Class to tune models such as RandomForest and XGBoost using different techniques.
+    """
+
+    def __init__(self):
+        """
+        Initializes parameter grids for RandomForest and XGBoost models.
+        """
+        self.rf_param_distributions = {
+            'validation_fraction': [0.1, 0.2, 0.3],
+            'max_depth': [10, 20, 30, None],
+            'min_samples_split': [2, 5, 10],
+            'min_samples_leaf': [1, 2, 4],
+            'max_features': ['sqrt', 0.5, None]
+        }
+        self.xgb_param_space = {
+            'learning_rate': Real(0.01, 0.2, prior='log-uniform'),
+            'max_depth': Integer(3, 9),
+            'n_estimators': Integer(100, 1000),
+            'subsample': Real(0.6, 1.0),
+            'colsample_bytree': Real(0.6, 1.0),
+            'gamma': Real(0, 0.5),
+            'reg_lambda': Real(0, 10),
+            'reg_alpha': Real(0, 1)
+        }
+
+    def tune_random_forest(self, X_train, y_train):
+        """
+        Tune the Random Forest model using RandomizedSearchCV with early stopping.
+
+        Searches for the best combination of hyperparameters, leveraging early stopping to optimize
+        the number of trees dynamically. Uses TimeSeriesSplit to respect temporal order in data.
+        """
+        rf = EarlyStoppingRandomForest(
+            random_state=42,
+            patience=10,
+            min_improvement=1e-4,
+            n_estimators=1000,
+            max_depth=None,
+            min_samples_split=2,
+            min_samples_leaf=1,
+            max_features=None
+        )
+        # Debugging: Print available parameters
+        logging.info("Available parameters for EarlyStoppingRandomForest: %s", rf.get_params().keys())
+        tscv = TimeSeriesSplit(n_splits=5)
+        random_search = RandomizedSearchCV(
+            estimator=rf,
+            param_distributions=self.rf_param_distributions,
+            n_iter=30,
+            scoring='neg_mean_squared_error',
+            cv=tscv,
+            n_jobs=-1,
+            verbose=1,
+            random_state=42
+        )
+        try:
+            logging.info("Starting Random Forest tuning...")
+            random_search.fit(X_train, y_train)
+            logging.info("Best parameters for Random Forest: %s", random_search.best_params_)
+            logging.info("Best score: %.6f MSE", -random_search.best_score_)
+            return random_search.best_estimator_, random_search.best_params_
+        except Exception as e:
+            logging.error("Error during Random Forest tuning: %s", e)
+            raise
+
+    def tune_xgboost(self, X_train, y_train, X_val=None, y_val=None, early_stopping_rounds=50):
+        """
+        Tunes the XGBoost model using Bayesian optimization with early stopping.
+        """
+        # Create the XGBoost model specifying eval_metric in the constructor
+        xgb_model = xgb.XGBRegressor(
+            random_state=42,
+            objective='reg:squarederror',
+            eval_metric='rmse'
+        )
+
+        # Configure the Bayesian search
+        bayes_search = BayesSearchCV(
+            estimator=xgb_model,
+            search_spaces=self.xgb_param_space,
+            n_iter=50,
+            scoring='neg_mean_squared_error',
+            cv=TimeSeriesSplit(n_splits=3),
+            n_jobs=-1,
+            verbose=1,
+            random_state=42
+        )
+
+        try:
+            logging.info("Starting XGBoost tuning...")
+            bayes_search.fit(X_train, y_train)
+
+            # Extract the best parameters and score
+            best_params = bayes_search.best_params_
+            best_score = -bayes_search.best_score_
+            logging.info(f"Best parameters for XGBoost: {best_params}")
+            logging.info(f"Best validation MSE: {best_score:.6f}")
+
+            # Create the final XGBoost model with the best parameters
+            final_xgb_model = xgb.XGBRegressor(
+                **best_params,
+                random_state=42,
+                objective='reg:squarederror',
+                eval_metric='rmse'
+            )
+
+            # Prepare the validation set for early stopping
+            evals = [(X_val, y_val)] if X_val is not None and y_val is not None else None
+
+            # Train the final model with early stopping
+            if evals:
+                final_xgb_model.fit(
+                    X_train, y_train,
+                    eval_set=evals,
+                    early_stopping_rounds=early_stopping_rounds,
+                    verbose=10
+                )
+            else:
+                # Train without early stopping if no validation set is provided
+                final_xgb_model.fit(X_train, y_train)
+
+            logging.info("XGBoost model trained successfully.")
+            return final_xgb_model, best_params
+
+        except Exception as e:
+            logging.error(f"Error during XGBoost tuning: {e}")
+            raise
+
+class MarketRegimeAnalyzer:
+    """
+    Analyzes market regimes using a Gaussian Hidden Markov Model.
+    Tunes the number of regimes with BIC and computes transition matrices.
+    """
+
+    def __init__(self, n_components=3, random_state=42):
+        self.n_components = n_components
+        self.random_state = random_state
+        self.model = GaussianHMM(n_components=n_components, covariance_type="full",
+                                 n_iter=1000, random_state=random_state)
+        self.scaler = StandardScaler()
+        self.features = ['Credit_Spread']
+
+    def fit(self, data):
+        """
+        Fits the HMM model to the specified features in the data.
+        """
+        available_features = [f for f in self.features if f in data.columns]
+        if not available_features:
+            logging.error("No feature available for market regime analysis.")
+            raise ValueError("No valid feature for HMM fitting.")
+        X = data[available_features].dropna()
+        if X.empty:
+            logging.error("No data available for regime analysis after dropping NaNs.")
+            raise ValueError("No valid data for HMM fitting.")
+        X_scaled = self.scaler.fit_transform(X)
+        self.model.fit(X_scaled)
+        self.used_features = available_features
+        logging.info("HMM model fitted successfully.")
+        return self
+
+    def predict(self, data):
+        """
+        Predicts market regimes using the fitted HMM model on the provided data.
+        """
+        X = data[self.used_features]
+        regimes = pd.Series(index=data.index, data=-1, dtype=int)
+        valid_X = X.dropna()
+        if not valid_X.empty:
+            X_scaled = self.scaler.transform(valid_X)
+            predicted = self.model.predict(X_scaled)
+            regimes.loc[valid_X.index] = predicted
+            logging.info(f"Predicted regimes: Last date {valid_X.index[-1]}, valid rows {len(valid_X)}")
+        return regimes
+
+    def analyze_regimes(self, data, regimes):
+        """
+        Computes mean, standard deviation, and count of Credit_Spread for each regime.
+        """
+        results = []
+        for regime in np.unique(regimes):
+            if regime == -1:
+                continue
+            regime_data = data['Credit_Spread'][regimes == regime]
+            results.append({
+                'regime': regime,
+                'mean': regime_data.mean(),
+                'std': regime_data.std(),
+                'count': len(regime_data)
+            })
+        return pd.DataFrame(results)
+
+    def compute_transition_matrix(self, regimes):
+        """
+        Calculates the transition matrix based on regime predictions.
+        """
+        regimes_array = regimes.values
+        n = self.n_components
+        matrix = np.zeros((n, n))
+        for i in range(len(regimes_array) - 1):
+            if regimes_array[i] != -1 and regimes_array[i + 1] != -1:
+                matrix[regimes_array[i], regimes_array[i + 1]] += 1
+        row_sums = matrix.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        transition_matrix = matrix / row_sums
+        return transition_matrix
+
+    def tune_n_components(self, data, components_range=range(2, 7)):
+        """
+        Determines the optimal number of regimes using BIC and prints the transition matrix for the best model.
+        """
+        available_features = [f for f in self.features if f in data.columns]
+        if not available_features:
+            raise ValueError("No valid feature for HMM tuning.")
+        X = data[available_features].dropna()
+        X_scaled = self.scaler.fit_transform(X)
+        best_bic = np.inf
+        best_n = None
+        best_model = None
+        for n in components_range:
+            model = GaussianHMM(n_components=n, covariance_type="full", n_iter=1000, random_state=self.random_state)
+            model.fit(X_scaled)
+            logL = model.score(X_scaled)
+            p = n ** 2 + 2 * n - 1
+            bic = -2 * logL + p * np.log(X_scaled.shape[0])
+            logging.info(f"n_components={n}, logL={logL:.2f}, BIC={bic:.2f}")
+            if bic < best_bic:
+                best_bic = bic
+                best_n = n
+                best_model = model
+        logging.info(f"Optimal number of regimes: {best_n} with BIC={best_bic:.2f}")
+        self.n_components = best_n
+        self.model = best_model
+        self.used_features = available_features
+        tuned_regimes = self.predict(data)
+        trans_matrix = self.compute_transition_matrix(tuned_regimes)
+        logging.info("Transition matrix for the tuned model:")
+        logging.info("\n" + str(trans_matrix))
+        return best_n, best_bic
+
+
+class Visualizer:
+    """
+    Provides methods for visualizing market regimes.
+    """
+
+    @staticmethod
+    def plot_regimes(data, regimes):
+        """
+        Plots Credit Spread data with different colors for each regime over time.
+        """
+        plt.figure(figsize=(10, 6))
+        for regime in np.unique(regimes):
+            if regime == -1:
+                continue
+            mask = regimes == regime
+            plt.scatter(data.index[mask], data['Credit_Spread'][mask], s=6, label=f'Regime {regime}')
+        plt.title('Credit Spread Regimes Over Time')
+        plt.xlabel('Date')
+        plt.ylabel('Credit Spread')
+        plt.legend()
+        plt.grid(True)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+        logging.info("Regime plot displayed.")
+
+
+class ModelEvaluator:
+    """
+    Class for evaluating regression models by computing performance metrics.
+    """
+
+    @staticmethod
+    def evaluate_models(models, X_train, y_train, X_test, y_test):
+        """
+        Trains models on the training set, predicts on the test set, and calculates RMSE, MAE, and R².
+        """
+        train_data = pd.concat([X_train, y_train], axis=1).dropna()
+        X_train = train_data.drop(columns=y_train.name)
+        y_train = train_data[y_train.name]
+        test_data = pd.concat([X_test, y_test], axis=1).dropna()
+        X_test = test_data.drop(columns=y_test.name)
+        y_test = test_data[y_test.name]
+        logging.info(f"Test set: {len(y_test)} rows, last date {y_test.index[-1]}")
+        results = []
+        for name, model in models.items():
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            mae = mean_absolute_error(y_test, y_pred)
+            r2 = model.score(X_test, y_test)
+            results.append({
+                'name': name,
+                'rmse': rmse,
+                'mae': mae,
+                'r2': r2,
+                'predictions': y_pred,
+                'test_index': y_test.index,
+                'y_test': y_test
+            })
+        return results
+
+
+class RiskAnalyzer:
+    """
+    Conducts risk analysis using Value-at-Risk (VaR) and stress testing.
+    """
+
+    def __init__(self):
+        self.var_confidence_levels = [0.90, 0.95, 0.99]
+
+    def calculate_var(self, returns, confidence_level=0.95):
+        """
+        Computes Value-at-Risk (VaR) for given returns at the specified confidence level.
+        """
+        return np.percentile(returns, (1 - confidence_level) * 100)
+
+    def stress_test(self, data, regime_labels):
+        """
+        Conducts stress testing on Credit_Spread returns across different market regimes.
+        """
+        results = {}
+        returns = data['Credit_Spread'].pct_change().dropna()
+        for regime in np.unique(regime_labels):
+            if regime == -1:
+                continue
+            regime_returns = returns[regime_labels == regime]
+            regime_stats = {'mean': regime_returns.mean(), 'std': regime_returns.std()}
+            for conf_level in self.var_confidence_levels:
+                regime_stats[f'VaR_{int(conf_level * 100)}'] = self.calculate_var(regime_returns, conf_level)
+            results[f'Regime_{regime}'] = regime_stats
+        return pd.DataFrame(results)
+
+
+def print_results_summary(results):
+    """
+    Displays a formatted summary table of model evaluation results.
+    """
+    print("\n--- Model Results ---")
+    header = f"{'Model':<25}{'RMSE':<15}{'MAE':<15}{'R²':<15}"
+    print(header)
+    print("-" * len(header))
+    for result in results:
+        row = f"{result['name']:<25}{result['rmse']:<15.6f}{result['mae']:<15.6f}{result['r2']:<15.6f}"
+        print(row)
+
+
+def plot_all_model_predictions(all_results):
+    """
+    Generates separate plots for each model's predictions with a year-formatted x-axis.
+    """
+    from matplotlib.dates import YearLocator, DateFormatter
+    for result in all_results:
+        model_name = result['name']
+        y_pred = result['predictions']
+        test_dates = result['test_index']
+        y_test = result['y_test']
+        plt.figure(figsize=(15, 6))
+        if 'Linear Regression' in model_name:
+            y_pred_exp = np.exp(y_pred) - 1
+            y_test_exp = np.exp(y_test) - 1
+            plt.plot(test_dates, y_test_exp, '.r-', label='True')
+            plt.plot(test_dates, y_pred_exp, '.b-', label='Predicted')
+            mse_val = mean_squared_error(y_test_exp, y_pred_exp)
+        else:
+            plt.plot(test_dates, y_test, '.r-', label='True')
+            plt.plot(test_dates, y_pred, '.b-', label='Predicted')
+            mse_val = mean_squared_error(y_test, y_pred)
+        plt.title(f'Credit Spread Prediction with {model_name} (MSE: {mse_val:.6f})', fontsize=12)
+        plt.xlabel('Date', fontsize=10)
+        plt.ylabel('Credit Spread', fontsize=10)
+        plt.legend(loc='upper right')
+        plt.grid(True)
+        plt.gca().xaxis.set_major_locator(YearLocator())
+        plt.gca().xaxis.set_major_formatter(DateFormatter('%Y'))
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+    logging.info("All model plots have been displayed in separate figures.")
+
+
+##########################################################
+#                      PIPELINE 2                        #
+##########################################################
+def c2_feature_engineering(df):
+    """
+    Applies feature engineering for Pipeline 2, adding lags and moving averages to Credit_Spread.
+    """
+    df = df.copy()
+    df['Credit_Spread_lag1'] = df['Credit_Spread'].shift(1)
+    df['Credit_Spread_MA5'] = df['Credit_Spread'].rolling(window=5).mean()
+    df['Credit_Spread_MA20'] = df['Credit_Spread'].rolling(window=20).mean()
+    return df
+
+
+def c2_prepare_target(df, target_column='Credit_Spread'):
+    """
+    Sets the target variable by shifting the specified column forward by one period.
+    """
+    df = df.copy()
+    df['Target_Credit_Spread'] = df[target_column].shift(-1)
+    return df.dropna(subset=['Target_Credit_Spread'])
+
+
+def c2_filter_data_from_2000(df):
+    """
+    Filters data to include only records from 2000 onward.
+    """
+    df = df.loc[df.index >= '2000-01-01']
+    logging.info(f"Dataset after filtering from 2000: {df.shape}")
+    return df
+
+
+def c2_explore_data(df):
+    """
+    Performs exploratory data analysis, printing summaries and plotting correlations and distributions.
+    """
+    print("First 5 rows:")
+    print(df.head())
+    print("\nDescriptive statistics:")
+    print(df.describe())
+    print("\nDataset info:")
+    print(df.info())
+    print("\nMissing values per column:")
+    print(df.isnull().sum())
+    plt.figure(figsize=(16, 12))
+    sns.heatmap(df.corr(), annot=True, cmap='coolwarm')
+    plt.title("Correlation Heatmap")
+    plt.show()
+    df.hist(bins=30, figsize=(20, 15))
+    plt.suptitle("Feature Distributions", fontsize=20)
+    plt.show()
+
+
+def c2_reduce_skew(df, cols, threshold=0.75):
+    """
+    Reduces skewness in specified columns with a log transformation if skewness exceeds the threshold.
+    """
+    from scipy.stats import skew
+    df_trans = df.copy()
+    for col in cols:
+        s = skew(df_trans[col].dropna())
+        if abs(s) > threshold:
+            df_trans[col] = np.log(df_trans[col] + 1)
+            logging.info(f"Log transformation applied to {col} (initial skew: {s:.2f}).")
+    return df_trans
+
+
+def c2_normalize_df(df, cols):
+    """
+    Normalizes specified columns using StandardScaler.
+    """
+    scaler = StandardScaler()
+    df[cols] = pd.DataFrame(scaler.fit_transform(df[cols]), columns=cols, index=df.index)
+    return df
+
+
+def c2_preprocess_dataset(df):
+    """
+    Preprocesses the dataset by filtering from 2000, filling missing values, reducing skewness, and normalizing.
+    """
+    df = df.loc[df.index >= '2000-01-01']
+    df = df.fillna(method='ffill').dropna()
+    feature_cols = df.columns.difference(['Target_Credit_Spread'])
+    df = c2_reduce_skew(df, feature_cols, threshold=0.75)
+    df = c2_normalize_df(df, feature_cols)
+    return df
+
+
+def c2_ensure_stationarity(data, cols, alpha=0.05):
+    """
+    Ensures stationarity in specified columns by differencing until ADF test p-value is below alpha.
+    """
+    data_stationary = data.copy()
+    diff_order = {}
+    for col in cols:
+        series = data_stationary[col].dropna()
+        order = 0
+        p_val = adfuller(series)[1]
+        while p_val > alpha and len(series) > 1:
+            series = series.diff().dropna()
+            order += 1
+            p_val = adfuller(series)[1]
+        diff_order[col] = order
+        data_stationary[col] = series.reindex(data_stationary.index, method='ffill')
+        data_stationary[col] = data_stationary[col].fillna(method='bfill')
+        logging.info(f"Column '{col}': differencing order = {order} (final p-value = {p_val:.4f}).")
+    return data_stationary, diff_order
+
+
+def c2_convert_categorical_to_numeric(df):
+    """
+    Converts categorical columns to numeric codes.
+    """
+    for col in df.columns:
+        if pd.api.types.is_categorical_dtype(df[col]):
+            logging.info(f"Converting column '{col}' to numeric.")
+            df[col] = df[col].cat.codes
+    return df
+
+
+def c2_add_market_regime(X, y, n_components=3, random_state=42):
+    """
+    Adds a market regime feature to X using a Gaussian HMM fitted on y.
+    """
+    np.random.seed(random_state)
+    hmm_model = GaussianHMM(n_components=n_components, covariance_type="full",
+                            n_iter=1000, algorithm='map', random_state=random_state)
+    y_reshaped = y.values.reshape(-1, 1)
+    hmm_model.fit(y_reshaped)
+    regimes = hmm_model.predict(y_reshaped)
+    X = X.copy()
+    X['market_regime_cs'] = regimes
+    return X, hmm_model
+
+
+def c2_find_feature_importance(X, y, threshold=0.005):
+    """
+    Computes feature importances with Random Forest, plots them, and selects features above the threshold.
+    """
+    X_numeric = X.select_dtypes(include=[np.number])
+    if X_numeric.empty:
+        raise ValueError("No numeric column available for Random Forest.")
+    rf = RandomForestRegressor(n_estimators=1000, max_depth=5,
+                               min_samples_leaf=4, max_features=0.1, random_state=42)
+    rf.fit(X_numeric, y)
+    features = X_numeric.columns.values
+    importances = rf.feature_importances_
+    sorted_idx = importances.argsort()
+    print("\nFeature Importances:")
+    for idx in sorted_idx:
+        print(f"{features[idx]:<40}: {importances[idx]:.6f}")
+    plt.figure(figsize=(10, 12))
+    plt.barh(features[sorted_idx], importances[sorted_idx], color='skyblue')
+    plt.xlabel('Importance')
+    plt.title('Feature Importance (Random Forest)')
+    plt.tight_layout()
+    plt.show()
+    selected_features = [f for imp, f in zip(importances, features) if imp >= threshold]
+    return selected_features
+
+
+##########################################################
+#                    PIPELINE 1                          #
+##########################################################
+def run_pipeline1(common_df):
+    """
+    Executes Pipeline 1: splits data, performs feature engineering, preprocessing, regime analysis,
+    model training, and risk analysis.
+    """
+    df1 = common_df.copy()
+    train_size = int(len(df1) * 0.8)
+    train_df = df1.iloc[:train_size].copy()
+    test_df = df1.iloc[train_size:].copy()
+    train_df = feature_engineering_causale(train_df)
+    test_df = feature_engineering_causale(test_df)
+    feature_cols = train_df.columns.difference(['Target', 'Credit_Spread'])
+    train_df = reduce_skew(train_df, feature_cols)
+    test_df = reduce_skew(test_df, feature_cols)
+    train_df, test_df = preprocess_data(train_df, test_df, feature_cols)
+    regime_analyzer = MarketRegimeAnalyzer(random_state=42)
+    best_n, best_bic = regime_analyzer.tune_n_components(train_df)
+    logging.info(f"Tuned number of regimes: {best_n} with BIC: {best_bic:.2f}")
+    train_df['Regime'] = regime_analyzer.predict(train_df)
+    test_df['Regime'] = regime_analyzer.predict(test_df)
+    trans_matrix = regime_analyzer.compute_transition_matrix(train_df['Regime'])
+    logging.info("Transition matrix (train set):")
+    logging.info("\n" + str(trans_matrix))
+    regime_analysis = regime_analyzer.analyze_regimes(train_df, train_df['Regime'])
+    print("Regime Analysis (Pipeline 1):\n", regime_analysis)
+    Visualizer.plot_regimes(pd.concat([train_df, test_df]), pd.concat([train_df['Regime'], test_df['Regime']]))
+    X_train = train_df.drop(columns=['Target', 'Credit_Spread'])
+    y_train = train_df['Target']
+    X_test = test_df.drop(columns=['Target', 'Credit_Spread'])
+    y_test = test_df['Target']
+    logging.info(f"X_train columns (Pipeline 1): {X_train.columns.tolist()}")
+    model_tuner = ModelTuner()
+    rf_model, rf_params = model_tuner.tune_random_forest(X_train, y_train)
+    xgb_model, xgb_params = model_tuner.tune_xgboost(X_train, y_train)
+    models = {
+        'Random Forest': rf_model,
+        'XGBoost': xgb_model
+    }
+    results = ModelEvaluator.evaluate_models(models, X_train, y_train, X_test, y_test)
+    risk_analyzer = RiskAnalyzer()
+    combined_regimes = pd.concat([train_df['Regime'], test_df['Regime']])
+    risk_metrics = risk_analyzer.stress_test(pd.concat([train_df, test_df]), combined_regimes)
+    print("\nRisk Metrics (Pipeline 1):\n", risk_metrics)
+    return results
+
+
+##########################################################
+#                    PIPELINE 2                          #
+##########################################################
+def run_pipeline2(common_df):
+    """
+    Executes Pipeline 2 with aligned test set start date, including preprocessing and linear regression.
+    """
+    df2 = common_df.copy()
+    daily_cols = ['Credit_Spread', 'TEDRATE', 'y_lag1', 'SPY_DIFF']
+    df_daily = df2[daily_cols].dropna()
+    non_daily_cols = list(set(df2.columns) - set(daily_cols))
+    df_non_daily = df2[non_daily_cols].ffill()
+    df2 = df_daily.join(df_non_daily, how='left').dropna(subset=daily_cols)
+    if not isinstance(df2.index, pd.DatetimeIndex):
+        df2.index = pd.to_datetime(df2.index)
+    df2 = c2_filter_data_from_2000(df2)
+    c2_explore_data(df2)
+    df2 = c2_feature_engineering(df2)
+    df2 = c2_prepare_target(df2, target_column='Credit_Spread')
+    df2 = c2_convert_categorical_to_numeric(df2)
+    df2_preprocessed = c2_preprocess_dataset(df2)
+    print("\nCheck for NaN values before Factor Analysis:")
+    print(df2_preprocessed.isnull().sum())
+    df2_preprocessed = df2_preprocessed.dropna()
+    feature_cols = df2_preprocessed.columns.difference(['Target_Credit_Spread'])
+    X_fa = df2_preprocessed[feature_cols]
+    fa = FactorAnalyzer(rotation='varimax')
+    fa.set_params(n_factors=X_fa.shape[1])
+    fa.fit(X_fa)
+    ev, _ = fa.get_eigenvalues()
+    plt.figure(figsize=(8, 6))
+    plt.plot(range(1, len(ev) + 1), ev, marker='o')
+    plt.xlabel('Factor Number')
+    plt.ylabel('Eigenvalue')
+    plt.title('Scree Plot for Factor Analysis')
+    plt.grid(True)
+    plt.show()
+    n_factors = sum(ev > 1)
+    print(f"Number of factors selected (eigenvalue > 1): {n_factors}")
+    fa.set_params(n_factors=n_factors, rotation='varimax')
+    fa.fit(X_fa)
+    if n_factors == 4:
+        factor_names = [
+            "Policy & Uncertainty Factor",
+            "Macro-Economic Conditions Factor",
+            "Credit Spread Factor",
+            "Trade & Security Factor"
+        ]
+    else:
+        factor_names = [f"Factor{i + 1}" for i in range(n_factors)]
+    loadings = pd.DataFrame(fa.loadings_, index=X_fa.columns, columns=factor_names)
+    print("\nFactor loadings:")
+    print(loadings)
+    fa_scores = fa.transform(X_fa)
+    df_fa = pd.DataFrame(fa_scores, columns=factor_names, index=df2_preprocessed.index)
+    df2_preprocessed = df2_preprocessed[['Target_Credit_Spread']].join(df_fa)
+    print("Final dataset with factor components:")
+    print(df2_preprocessed.head())
+    features_to_stationarize = df2_preprocessed.columns.difference(['Target_Credit_Spread'])
+    df_stationary, diff_info = c2_ensure_stationarity(df2_preprocessed, features_to_stationarize, alpha=0.05)
+    print("Differencing orders:", diff_info)
+    train_size = int(len(common_df) * 0.8)
+    train_end_date = common_df.index[train_size - 1]
+    X_train = df_stationary.drop(columns=['Target_Credit_Spread']).loc[:train_end_date]
+    y_train = df_stationary['Target_Credit_Spread'].loc[:train_end_date]
+    X_test = df_stationary.drop(columns=['Target_Credit_Spread']).loc[train_end_date + pd.Timedelta(days=1):]
+    y_test = df_stationary['Target_Credit_Spread'].loc[train_end_date + pd.Timedelta(days=1):]
+    logging.info(f"Pipeline 2 - Train size: {len(X_train)}, Test size: {len(X_test)}, Test start: {X_test.index[0]}")
+    X_train, hmm_model = c2_add_market_regime(X_train, y_train, n_components=3, random_state=42)
+    X_test = X_test.copy()
+    X_test['market_regime_cs'] = hmm_model.predict(y_test.values.reshape(-1, 1))
+    X_train = c2_convert_categorical_to_numeric(X_train)
+    X_test = c2_convert_categorical_to_numeric(X_test)
+    y_train_log = np.log(y_train + 1)
+    y_test_log = np.log(y_test + 1)
+    X_train_numeric = X_train.select_dtypes(include=[np.number])
+    X_test_numeric = X_test.select_dtypes(include=[np.number])
+    print("Columns in X_train_numeric:", X_train_numeric.columns.tolist())
+    selected_features = c2_find_feature_importance(X_train_numeric, y_train_log, threshold=0.005)
+    X_train_selected = X_train_numeric[selected_features]
+    X_test_selected = X_test_numeric[selected_features]
+    lin_model = LinearRegression()
+    lin_model.fit(X_train_selected, y_train_log)
+    y_pred = lin_model.predict(X_test_selected)
+    rmse = np.sqrt(mean_squared_error(y_test_log, y_pred))
+    mae = mean_absolute_error(y_test_log, y_pred)
+    r2 = r2_score(y_test_log, y_pred)
+    results = [{
+        'name': 'Linear Regression',
+        'rmse': rmse,
+        'mae': mae,
+        'r2': r2,
+        'predictions': y_pred,
+        'test_index': y_test_log.index,
+        'y_test': y_test_log
+    }]
+    return results
+
+
+##########################################################
+#                        MAIN                            #
+##########################################################
+def main():
+    """
+    Main function to load data, execute both pipelines, summarize results, and plot predictions.
+    """
+    config = CommonConfig()
+    loader = CommonDataLoader(config)
+    fred_df = loader.fetch_fred_data()
+    ted_series = loader.load_tedrate()
+    yahoo_df = loader.fetch_yahoo_data()
+    policy_df = loader.load_policy_data()
+    fred_df['TEDRATE'] = ted_series
+    combined_df = pd.concat([fred_df, yahoo_df, policy_df], axis=1)
+    combined_df = combined_df.loc[config.START_DATE:]
+    logging.info(f"Combined dataset: {combined_df.shape}, Columns: {combined_df.columns.tolist()}")
+    results_pipeline1 = run_pipeline1(combined_df)
+    results_pipeline2 = run_pipeline2(combined_df)
+    all_results = results_pipeline1 + results_pipeline2
+    print_results_summary(all_results)
+    plot_all_model_predictions(all_results)
+
+
+if __name__ == "__main__":
+    main()
+
+""" 
+
+Our model tuning process optimizes both Random Forest and XGBoost for predicting credit spreads. 
+For Random Forest, we use RandomizedSearchCV with TimeSeriesSplit to explore hyperparameters like max_depth,
+max_features, and validation_fraction, employing EarlyStoppingRandomForest to select the optimal number of trees
+based on a validation set.
+For XGBoost, BayesSearchCV tunes parameters such as learning_rate, max_depth, and subsample over multiple iterations.
+The validation MSE for Random Forest (0.000206, RMSE = 0.014337) (which I calculated as evidence to verify and then removed) 
+is lower than the test MSE (0.002149), likely due to early stopping optimization, but the excellent test performance 
+and low tree count indicate no significant overfitting for either model.
+
+"""

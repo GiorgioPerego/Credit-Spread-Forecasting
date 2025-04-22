@@ -94,12 +94,111 @@ scikit-optimize>=0.9.0
    pip install -r requirements.txt
    ```
 
+## Usage
+
+### Basic Configuration
+```python
+from config import CommonConfig
+from data_loader import CommonDataLoader
+
+# Initialize configuration
+config = CommonConfig(
+    start_date="2010-01-01",
+    end_date="2023-12-31",
+    prediction_horizon=30
+)
+
+# Load data
+loader = CommonDataLoader(config)
+data = loader.load_all_sources()
+```
+
+### Preprocessing and Feature Engineering
+```python
+from preprocessing import preprocess_data
+from feature_engineering import create_features
+
+# Basic preprocessing
+df_processed = preprocess_data(
+    data,
+    handle_missing=True,
+    remove_outliers=True
+)
+
+# Feature engineering
+df_features = create_features(
+    df_processed,
+    lag_window=30,
+    ma_windows=[7, 14, 30]
+)
+```
+
+### Training and Evaluation
+```python
+from models import EarlyStoppingRandomForest, XGBoostOptimized
+
+# Training Random Forest
+rf_model = EarlyStoppingRandomForest(
+    n_estimators=1000,
+    early_stopping_rounds=50
+)
+rf_model.fit(X_train, y_train, eval_set=(X_val, y_val))
+
+# Training XGBoost
+xgb_model = XGBoostOptimized(
+    max_depth=6,
+    learning_rate=0.01
+)
+xgb_model.fit(X_train, y_train)
+```
+
+## Advanced Features
+
+### Random Forest with Early Stopping
+- Continuous performance monitoring
+- Automatic tree number optimization
+- Dedicated validation set
+- Dynamic overfitting management
+
+### XGBoost with Bayesian Optimization
+- Optimal hyperparameter search
+- Early stopping on validation set
+- Automatic overfitting management
+- Custom metrics
+
+### Market Regime Analysis
+- Automatic regime identification
+- Transition matrix calculation
+- State number optimization
+- Regime-specific predictions
+
 ## Contributing
 
 You are welcome to contribute to the project. To do so:
 1. Fork the repository
 2. Create a branch for your changes
 3. Submit a pull request
+
+## Data Updates
+
+To update the project data:
+
+1. Modify the end date in the configuration file:
+   ```python
+   config = CommonConfig(
+       end_date="YYYY-MM-DD"  # Insert the new end date
+   )
+   ```
+
+2. Download new data:
+   - TED Spread: Update data from FACSET
+   - EPU Data: Download new Categorical US EPU data from https://www.policyuncertainty.com/categorical_epu.html
+
+3. Execute the update process:
+   ```python
+   loader = CommonDataLoader(config)
+   data = loader.load_all_sources()
+   ```
 
 ## License
 
@@ -112,7 +211,7 @@ If you use this project in your research, please cite:
 ```bibtex
 @software{credit_spread_prediction,
   author = {Author Name},
-  title = {Credit Spread Forecasting},
+  title = {Credit Spread Prediction Project},
   year = {2024},
   publisher = {GitHub},
   url = {https://github.com/yourusername/credit-spread-prediction}

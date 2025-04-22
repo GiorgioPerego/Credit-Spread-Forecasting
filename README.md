@@ -190,7 +190,7 @@ If you use this project in your research, please cite:
 ```bibtex
 @software{credit_spread_prediction,
   author = {Author Name},
-  title = {Credit Spread Prediction Project},
+  title = {Credit Spread Forecasting},
   year = {2024},
   publisher = {GitHub},
   url = {https://github.com/yourusername/credit-spread-prediction}

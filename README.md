@@ -1,5 +1,5 @@
 # Credit-Spread-Forecasting
-# Credit Spread Prediction Project
+
 
 This project implements an advanced system for credit spread prediction using machine learning techniques and market regime analysis. The system combines data from various financial sources and uses models such as Random Forest and XGBoost with early stopping to optimize predictions.
 

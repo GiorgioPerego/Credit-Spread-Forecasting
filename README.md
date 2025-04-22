@@ -107,7 +107,7 @@ To update the project data:
 
 2. Download new data:
    - TED Spread: Update data from FactSet
-   - EPU Data: Download new Categorical US EPU data from https://www.policyuncertainty.com/categorical_epu.html
+   - EPU Data: Download new Categorical US EPU data from https://www.policyuncertainty.com/categorical_epu.html and convert in csv
 
 3. Execute the update process:
    ```python

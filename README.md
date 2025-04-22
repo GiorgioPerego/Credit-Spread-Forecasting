@@ -93,7 +93,28 @@ scikit-optimize>=0.9.0
    ```bash
    pip install -r requirements.txt
    ```
-   
+
+## Data Updates
+
+To update the project data:
+
+1. Modify the end date in the configuration file:
+   ```python
+   config = CommonConfig(
+       end_date="YYYY-MM-DD"  # Insert the new end date
+   )
+   ```
+
+2. Download new data:
+   - TED Spread: Update data from FactSet
+   - EPU Data: Download new Categorical US EPU data from https://www.policyuncertainty.com/categorical_epu.html
+
+3. Execute the update process:
+   ```python
+   loader = CommonDataLoader(config)
+   data = loader.load_all_sources()
+   ```
+
 ## License
 
 This project is distributed under the MIT License.

@@ -124,11 +124,11 @@ This project is distributed under the MIT License.
 If you use this project in your research, please cite:
 
 ```bibtex
-@software{credit_spread_prediction,
-  author = {Author Name},
+@software{credit_spread_forecasting,
+  author = {Giorgio Perego},
   title = {Credit Spread Forecasting},
   year = {2025},
   publisher = {GitHub},
-  url = {https://github.com/yourusername/credit-spread-prediction}
+  url = {https://github.com/Atomino_bb/Credit-Spread-Forecasting}
 }
 ```

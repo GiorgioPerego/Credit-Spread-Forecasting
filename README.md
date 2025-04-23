@@ -126,8 +126,8 @@ If you use this project in your research, please cite:
 ```bibtex
 @software{credit_spread_prediction,
   author = {Author Name},
-  title = {Credit Spread Prediction Project},
-  year = {2024},
+  title = {Credit Spread Forecasting},
+  year = {2025},
   publisher = {GitHub},
   url = {https://github.com/yourusername/credit-spread-prediction}
 }
